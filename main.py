@@ -23,7 +23,8 @@ app.add_middleware(
 def home():
     return {
         "status": "online",
-        "project": "SBP SkyBlock Price Predictor"
+        "project": "SBP SkyBlock Price Predictor",
+        "version": "one-month-history-v1"
     }
 
 
@@ -77,12 +78,15 @@ def item(item_id: str):
         .execute()
     )
 
+    # One month at 5-minute collection intervals:
+    # 12 snapshots/hour * 24 hours/day * 30 days = 8640 snapshots.
+    # 9000 gives a tiny buffer. If less data exists, Supabase simply returns what exists.
     history = (
         supabase.table("price_snapshots")
         .select("price,created_at")
         .eq("item_id", item_id)
         .order("created_at", desc=True)
-        .limit(60)
+        .limit(9000)
         .execute()
     )
 
