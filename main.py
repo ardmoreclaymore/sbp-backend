@@ -51,6 +51,22 @@ def top20():
     return result.data
 
 
+@app.get("/api/items")
+def all_items():
+    """
+    Returns all collected items.
+    collector.py already filters out items below 100k, so this endpoint is the full 100k+ pool.
+    """
+    result = (
+        supabase.table("items")
+        .select("id,name,current_price,source,updated_at")
+        .order("current_price", desc=True)
+        .limit(2000)
+        .execute()
+    )
+    return result.data
+
+
 @app.get("/api/item/{item_id}")
 def item(item_id: str):
     prediction = (
@@ -85,7 +101,7 @@ def search(q: str = ""):
         supabase.table("items")
         .select("id,name,current_price")
         .ilike("name", f"%{q}%")
-        .limit(30)
+        .limit(50)
         .execute()
     )
     return result.data
