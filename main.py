@@ -24,7 +24,7 @@ def home():
     return {
         "status": "online",
         "project": "SBP SkyBlock Price Predictor",
-        "version": "ah-bz-context-safe-v2"
+        "version": "ah-bz-context-final-v3"
     }
 
 
@@ -54,14 +54,6 @@ def top20():
 
 @app.get("/api/items")
 def all_items():
-    """
-    Returns the full item pool currently stored in Supabase.
-
-    Your collector is responsible for deciding which items are stored.
-    Right now that should include:
-    - Bazaar items over your minimum price filter
-    - Auction House lowest BIN items over your minimum price filter
-    """
     result = (
         supabase.table("items")
         .select("id,name,current_price,source,updated_at")
@@ -74,17 +66,11 @@ def all_items():
 
 @app.get("/api/context")
 def context():
-    """
-    Safe context endpoint for the website info board.
-
-    This should never crash the website. If the market_context table is missing,
-    empty, or has slightly different columns, this returns fallback text instead.
-    """
     fallback = {
         "current_mayor": "Loading mayor data",
         "current_meta": "Work in progress — verified meta source pending",
-        "ai_factor_1": "AI factor slot",
-        "ai_factor_2": "Update/event slot",
+        "ai_factor_1": "Work in progress",
+        "ai_factor_2": "Work in progress",
         "updated_at": None
     }
 
@@ -92,6 +78,7 @@ def context():
         result = (
             supabase.table("market_context")
             .select("*")
+            .eq("id", 1)
             .limit(1)
             .execute()
         )
@@ -102,32 +89,14 @@ def context():
         row = result.data[0]
 
         return {
-            "current_mayor": (
-                row.get("current_mayor")
-                or row.get("mayor")
-                or row.get("mayor_name")
-                or fallback["current_mayor"]
-            ),
-            "current_meta": (
-                row.get("current_meta")
-                or row.get("meta")
-                or fallback["current_meta"]
-            ),
-            "ai_factor_1": (
-                row.get("ai_factor_1")
-                or row.get("factor_1")
-                or fallback["ai_factor_1"]
-            ),
-            "ai_factor_2": (
-                row.get("ai_factor_2")
-                or row.get("factor_2")
-                or fallback["ai_factor_2"]
-            ),
+            "current_mayor": row.get("current_mayor") or fallback["current_mayor"],
+            "current_meta": row.get("current_meta") or fallback["current_meta"],
+            "ai_factor_1": row.get("ai_factor_1") or fallback["ai_factor_1"],
+            "ai_factor_2": row.get("ai_factor_2") or fallback["ai_factor_2"],
             "updated_at": row.get("updated_at")
         }
 
     except Exception as e:
-        # Return 200 with fallback so the frontend does not break.
         fallback["error"] = str(e)
         return fallback
 
@@ -144,7 +113,6 @@ def item(item_id: str):
 
     # One month at 5-minute collection intervals:
     # 12 snapshots/hour * 24 hours/day * 30 days = 8640 snapshots.
-    # 9000 gives a small buffer. If less data exists, Supabase returns what exists.
     history = (
         supabase.table("price_snapshots")
         .select("price,created_at")
