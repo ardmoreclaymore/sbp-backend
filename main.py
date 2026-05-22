@@ -24,8 +24,21 @@ def home():
     return {
         "status": "online",
         "project": "SBP SkyBlock Price Predictor",
-        "version": "one-month-history-v1"
+        "version": "ah-bz-context-v1"
     }
+
+
+@app.get("/api/context")
+def context():
+    result = (
+        supabase.table("market_context")
+        .select("*")
+        .order("updated_at", desc=True)
+        .execute()
+    )
+
+    rows = result.data or []
+    return {row["key"]: row for row in rows}
 
 
 @app.get("/api/top5")
@@ -55,14 +68,14 @@ def top20():
 @app.get("/api/items")
 def all_items():
     """
-    Returns all collected items.
-    collector.py already filters out items below 100k, so this endpoint is the full 100k+ pool.
+    Returns all collected items above the collector's MINIMUM_PRICE.
+    This now includes Bazaar items and Auction House LBIN items.
     """
     result = (
         supabase.table("items")
         .select("id,name,current_price,source,updated_at")
         .order("current_price", desc=True)
-        .limit(2000)
+        .limit(10000)
         .execute()
     )
     return result.data
@@ -80,7 +93,6 @@ def item(item_id: str):
 
     # One month at 5-minute collection intervals:
     # 12 snapshots/hour * 24 hours/day * 30 days = 8640 snapshots.
-    # 9000 gives a tiny buffer. If less data exists, Supabase simply returns what exists.
     history = (
         supabase.table("price_snapshots")
         .select("price,created_at")
@@ -103,9 +115,9 @@ def item(item_id: str):
 def search(q: str = ""):
     result = (
         supabase.table("items")
-        .select("id,name,current_price")
+        .select("id,name,current_price,source")
         .ilike("name", f"%{q}%")
-        .limit(50)
+        .limit(100)
         .execute()
     )
     return result.data
