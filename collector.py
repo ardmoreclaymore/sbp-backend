@@ -13,13 +13,16 @@ SUPABASE_SERVICE_KEY = os.environ["SUPABASE_SERVICE_KEY"]
 
 supabase = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
 
+print("SBP FINAL COLLECTOR ALL AH + ALL BZ VERSION RUNNING")
+
 HYPIXEL_BAZAAR_URL = "https://api.hypixel.net/v2/skyblock/bazaar"
 HYPIXEL_AUCTIONS_URL = "https://api.hypixel.net/v2/skyblock/auctions"
 HYPIXEL_ELECTION_URL = "https://api.hypixel.net/v2/resources/skyblock/election"
 
-MINIMUM_PRICE = int(os.getenv("MINIMUM_PRICE", "100000"))
+MINIMUM_PRICE = int(os.getenv("MINIMUM_PRICE", "0"))
 
 # Use "all" for a full AH sweep. Use a number like "10" for testing.
+# With MINIMUM_PRICE=0, this collects cheap items too, including wheat-level Bazaar products.
 AH_MAX_PAGES = os.getenv("AH_MAX_PAGES", "all").strip().lower()
 
 SLEEP_BETWEEN_AH_PAGES = float(os.getenv("SLEEP_BETWEEN_AH_PAGES", "0.25"))
