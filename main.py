@@ -24,7 +24,7 @@ def home():
     return {
         "status": "online",
         "project": "SBP SkyBlock Price Predictor",
-        "version": "ah-bz-context-final-v3"
+        "version": "all-ah-bz-no-min-price-v4"
     }
 
 
@@ -58,7 +58,7 @@ def all_items():
         supabase.table("items")
         .select("id,name,current_price,source,updated_at")
         .order("current_price", desc=True)
-        .limit(5000)
+        .limit(50000)
         .execute()
     )
     return result.data or []
