@@ -1,0 +1,29 @@
+Delete old GitHub root files, then upload every file in this ZIP to the root of your sbp-backend repo.
+
+Required root files:
+- README.md
+- SOURCE_AND_ACCURACY_NOTES.md
+- backtest.py
+- collector.py
+- config.py
+- factor_loader.py
+- main.py
+- normalizers.py
+- predictor.py
+- requirements.txt
+- sources.py
+- supabase_schema.sql
+
+Render Web Service:
+- Start command: uvicorn main:app --host 0.0.0.0 --port $PORT
+
+Render Cron Job:
+- Command: python collector.py
+- Schedule: */5 * * * *
+
+After upload:
+1. Render web service: Clear build cache & deploy.
+2. Render cron job: Clear build cache & deploy.
+3. Run cron manually.
+4. Logs must show: COLLECTOR VERSION: AH_BZ_V7_FIXED
+5. Logs should show: Bazaar collected + Auction House collected.
