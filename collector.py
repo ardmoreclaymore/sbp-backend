@@ -210,12 +210,24 @@ def collect_auction_items():
 def build_predictions(items):
     factors = load_prediction_factors(supabase)
     rows = []
-    for item in items:
-        history = get_recent_history(item["id"], 20)
+
+    print(f"Fast prediction mode for {len(items)} items")
+
+    for index, item in enumerate(items, start=1):
         matched = match_factors_to_item(item, factors)
-        pred = score_item(item, history=history, matched_factors=matched)
+
+        # FAST MODE:
+        # Do not fetch Supabase history for every item.
+        # 5k+ separate history reads makes the cron too slow and can fail.
+        pred = score_item(item, history=[], matched_factors=matched)
+
         pred["updated_at"] = now_iso()
         rows.append(pred)
+
+        if index % 500 == 0:
+            print(f"Built {index}/{len(items)} predictions")
+
+    print(f"Finished building {len(rows)} predictions")
     return rows
 
 
