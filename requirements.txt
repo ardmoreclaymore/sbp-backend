@@ -3,3 +3,4 @@ uvicorn
 requests
 supabase
 python-dotenv
+beautifulsoup4
