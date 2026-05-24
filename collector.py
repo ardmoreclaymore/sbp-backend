@@ -13,7 +13,7 @@ SUPABASE_SERVICE_KEY = os.environ["SUPABASE_SERVICE_KEY"]
 
 supabase = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
 
-print("SBP FINAL COLLECTOR ALL AH + ALL BZ + MINISTER VERSION RUNNING")
+print("SBP FINAL COLLECTOR ALL AH + ALL BZ VERSION RUNNING")
 
 HYPIXEL_BAZAAR_URL = "https://api.hypixel.net/v2/skyblock/bazaar"
 HYPIXEL_AUCTIONS_URL = "https://api.hypixel.net/v2/skyblock/auctions"
@@ -379,80 +379,33 @@ def collect_auction_house(previous_prices):
     return item_rows, snapshot_rows, prediction_rows
 
 
-def strip_minecraft_codes(text):
-    if text is None:
-        return ""
-    return re.sub(r"§.", "", str(text)).strip()
-
-
-def summarize_perks(perks, max_count=4):
-    names = []
-    for perk in perks or []:
-        if isinstance(perk, dict):
-            name = strip_minecraft_codes(perk.get("name"))
-            if name:
-                names.append(name)
-        elif isinstance(perk, str):
-            cleaned = strip_minecraft_codes(perk)
-            if cleaned:
-                names.append(cleaned)
-    return names[:max_count]
-
-
-def fetch_election_context():
-    """
-    Source of truth for live context:
-    - current mayor: payload["mayor"], NOT election candidate leader
-    - current minister: payload["mayor"]["minister"]
-    """
-    fallback = {
-        "current_mayor": "Unknown mayor",
-        "current_mayor_key": "",
-        "current_mayor_perks": "",
-        "current_minister": "No minister data",
-        "current_minister_key": "",
-        "current_minister_perk": "No minister perk data",
-        "current_minister_perk_description": "",
-        "election_year": None,
-    }
-
+def fetch_current_mayor_text():
     try:
         payload = get_json(HYPIXEL_ELECTION_URL)
         mayor = payload.get("mayor") or {}
 
-        mayor_name = strip_minecraft_codes(mayor.get("name")) or fallback["current_mayor"]
-        mayor_key = strip_minecraft_codes(mayor.get("key"))
-        mayor_perks = summarize_perks(mayor.get("perks"), 4)
+        name = mayor.get("name") or "Unknown mayor"
+        perks_raw = mayor.get("perks") or []
+        perks = []
 
-        minister = mayor.get("minister") or {}
-        minister_name = strip_minecraft_codes(minister.get("name")) or "No minister"
-        minister_key = strip_minecraft_codes(minister.get("key"))
-        minister_perk_obj = minister.get("perk") or {}
+        for perk in perks_raw:
+            if isinstance(perk, dict):
+                perk_name = perk.get("name")
+                if perk_name:
+                    perks.append(perk_name)
+            elif isinstance(perk, str):
+                perks.append(perk)
 
-        minister_perk_name = strip_minecraft_codes(minister_perk_obj.get("name")) or "No minister perk"
-        minister_perk_description = strip_minecraft_codes(minister_perk_obj.get("description"))
-
-        election = payload.get("election") or {}
-        election_year = election.get("year")
-
-        return {
-            "current_mayor": mayor_name,
-            "current_mayor_key": mayor_key,
-            "current_mayor_perks": ", ".join(mayor_perks),
-            "current_minister": minister_name,
-            "current_minister_key": minister_key,
-            "current_minister_perk": minister_perk_name,
-            "current_minister_perk_description": minister_perk_description,
-            "election_year": election_year,
-        }
+        if perks:
+            return f"{name} — {', '.join(perks[:3])}"
+        return name
 
     except Exception as exc:
-        fallback["current_mayor"] = f"Unknown mayor ({exc})"
-        return fallback
+        return f"Unknown mayor ({exc})"
 
 
 def update_market_context(stats):
-    election_context = fetch_election_context()
+    current_mayor = fetch_current_mayor_text()
 
     current_meta = (
         CURRENT_META_OVERRIDE
@@ -462,28 +415,12 @@ def update_market_context(stats):
 
     context_row = {
         "id": 1,
-        "current_mayor": election_context.get("current_mayor"),
-        "current_mayor_key": election_context.get("current_mayor_key"),
-        "current_mayor_perks": election_context.get("current_mayor_perks"),
-        "current_minister": election_context.get("current_minister"),
-        "current_minister_key": election_context.get("current_minister_key"),
-        "current_minister_perk": election_context.get("current_minister_perk"),
-        "current_minister_perk_description": election_context.get("current_minister_perk_description"),
-        "election_year": election_context.get("election_year"),
+        "current_mayor": current_mayor,
         "current_meta": current_meta,
         "ai_factor_1": f"{stats.get('total_items', 0)} items tracked",
         "ai_factor_2": "Update/event slot — work in progress",
         "updated_at": utc_now()
     }
-
-    print(
-        "Context update:",
-        context_row["current_mayor"],
-        "| Minister:",
-        context_row["current_minister"],
-        "-",
-        context_row["current_minister_perk"]
-    )
 
     supabase.table("market_context").upsert(context_row).execute()
 
