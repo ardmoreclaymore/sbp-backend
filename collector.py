@@ -1,554 +1,296 @@
-import os
-import re
-import math
-import time
-import hashlib
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
+from statistics import median
 
-import requests
 from supabase import create_client
 
-SUPABASE_URL = os.environ["SUPABASE_URL"]
-SUPABASE_SERVICE_KEY = os.environ["SUPABASE_SERVICE_KEY"]
+from config import SUPABASE_URL, SUPABASE_SERVICE_KEY, PROJECT_NAME, VERSION, MINIMUM_PRICE, AH_MAX_PAGES, SNAPSHOT_KEEP_DAYS
+from sources import fetch_bazaar, fetch_auction_page, fetch_current_mayor_context, fetch_meta_context
+from normalizers import safe_float, safe_int, bz_name, ah_item_id, category_guess, spread_pct, pct_change
+from predictor import score_item
+from factor_loader import load_prediction_factors, match_factors_to_item
+
+print("COLLECTOR VERSION: AH_BZ_V7_FIXED")
+
+if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
+    raise RuntimeError("Missing SUPABASE_URL or SUPABASE_SERVICE_KEY / SUPABASE_SERVICE_ROLE_KEY")
 
 supabase = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
 
-print("SBP SCREENSHOT WEBSITE COLLECTOR: ALL AH + ALL BZ + MAYOR + MINISTER")
 
-HYPIXEL_BAZAAR_URL = "https://api.hypixel.net/v2/skyblock/bazaar"
-HYPIXEL_AUCTIONS_URL = "https://api.hypixel.net/v2/skyblock/auctions"
-HYPIXEL_ELECTION_URL = "https://api.hypixel.net/v2/resources/skyblock/election"
-
-# 0 means even wheat-level Bazaar products are tracked.
-MINIMUM_PRICE = int(os.getenv("MINIMUM_PRICE", "0"))
-
-# Use "all" for full Auction House sweep. Use 10/25/50 for testing.
-AH_MAX_PAGES = os.getenv("AH_MAX_PAGES", "all").strip().lower()
-
-SLEEP_BETWEEN_AH_PAGES = float(os.getenv("SLEEP_BETWEEN_AH_PAGES", "0.25"))
-REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "45"))
-UPSERT_CHUNK_SIZE = int(os.getenv("UPSERT_CHUNK_SIZE", "500"))
-
-# Optional manual meta label. Do not fake meta automatically.
-CURRENT_META_OVERRIDE = os.getenv("CURRENT_META_OVERRIDE", "").strip()
-
-
-def utc_now():
+def now_iso():
     return datetime.now(timezone.utc).isoformat()
 
 
-def safe_float(value, fallback=0.0):
+def chunked(items, size=500):
+    for i in range(0, len(items), size):
+        yield items[i:i + size]
+
+
+def get_recent_history(item_id, limit=20):
     try:
-        if value is None:
-            return fallback
-        value = float(value)
-        if math.isnan(value) or math.isinf(value):
-            return fallback
-        return value
-    except Exception:
-        return fallback
+        response = supabase.table("price_snapshots").select("price,current_price,buy_price,sell_price,created_at").eq("item_id", item_id).order("created_at", desc=True).limit(limit).execute()
+        return response.data or []
+    except Exception as exc:
+        print(f"History unavailable for {item_id}: {exc}")
+        return []
 
 
-def pct_change(old, new):
-    old = safe_float(old)
-    new = safe_float(new)
-    if old <= 0:
-        return 0.0
-    return ((new - old) / old) * 100
-
-
-def nice_name(product_id):
-    return str(product_id).replace("_", " ").title()
-
-
-def clean_name(name):
-    if not name:
-        return "Unknown Item"
-    name = re.sub(r"§.", "", str(name))
-    return " ".join(name.split()).strip()
-
-
-def stable_ah_id(item_name):
-    cleaned = clean_name(item_name).lower()
-    digest = hashlib.sha1(cleaned.encode("utf-8")).hexdigest()[:14]
-    return f"AH:{digest}"
-
-
-def guess_category(name, source="bazaar"):
-    text = (name or "").upper()
-    if "KUUDRA" in text:
-        return "KUUDRA"
-    if "ENCHANT" in text or "BOOK" in text:
-        return "ENCHANT"
-    if "ESSENCE" in text or "DUNGEON" in text or "NECRON" in text or "STORM" in text or "WITHER" in text:
-        return "DUNGEON"
-    if "DRAGON" in text or "SLAYER" in text or "REVENANT" in text or "TARANTULA" in text or "SVEN" in text or "VOIDGLOOM" in text or "BLAZE" in text:
-        return "SLAYER"
-    if "FISH" in text or "SHARK" in text or "ROD" in text:
-        return "FISHING"
-    if "WHEAT" in text or "CARROT" in text or "POTATO" in text or "MELON" in text or "PUMPKIN" in text or "CACTUS" in text:
-        return "FARMING"
-    if "MITHRIL" in text or "GEMSTONE" in text or "JADE" in text or "AMBER" in text or "RUBY" in text or "SAPPHIRE" in text:
-        return "MINING"
-    if source == "auction":
-        return "AUCTION"
-    return "BAZAAR"
-
-
-def get_json(url, params=None):
-    response = requests.get(url, params=params, timeout=REQUEST_TIMEOUT)
-    if response.status_code == 429:
-        raise RuntimeError(f"Rate limited while requesting {url}. Use fewer AH pages or more delay.")
-    response.raise_for_status()
-    return response.json()
-
-
-def chunked(rows, size=UPSERT_CHUNK_SIZE):
-    for i in range(0, len(rows), size):
-        yield rows[i:i + size]
-
-
-def upsert_rows(table, rows):
+def upsert_rows(table, rows, conflict_key=None, batch_size=500):
     if not rows:
         return
-    for chunk in chunked(rows):
-        supabase.table(table).upsert(chunk).execute()
-
-
-def insert_rows(table, rows):
-    if not rows:
-        return
-    for chunk in chunked(rows):
-        supabase.table(table).insert(chunk).execute()
-
-
-def fetch_previous_prices():
-    previous = {}
-    page_size = 1000
-    start = 0
-
-    while True:
-        result = (
-            supabase.table("items")
-            .select("id,current_price")
-            .range(start, start + page_size - 1)
-            .execute()
-        )
-        data = result.data or []
-        for row in data:
-            previous[row["id"]] = safe_float(row.get("current_price"))
-        if len(data) < page_size:
-            break
-        start += page_size
-
-    return previous
-
-
-def score_market_item(item_id, name, source, current_price, previous_price, quick=None, ah_count=0):
-    quick = quick or {}
-
-    buy_price = safe_float(quick.get("buyPrice"))
-    sell_price = safe_float(quick.get("sellPrice"))
-    buy_volume = safe_float(quick.get("buyVolume"))
-    sell_volume = safe_float(quick.get("sellVolume"))
-    buy_moving_week = safe_float(quick.get("buyMovingWeek"))
-    sell_moving_week = safe_float(quick.get("sellMovingWeek"))
-    buy_orders = safe_float(quick.get("buyOrders"))
-    sell_orders = safe_float(quick.get("sellOrders"))
-
-    momentum = pct_change(previous_price, current_price) if previous_price else 0.0
-
-    spread_pct = 0.0
-    if buy_price > 0 and sell_price > 0:
-        spread_pct = ((buy_price - sell_price) / max(1.0, buy_price)) * 100
-
-    if source == "bazaar":
-        total_week_volume = buy_moving_week + sell_moving_week
-        volume_score = min(10.0, math.log10(max(1.0, total_week_volume)) * 1.25)
-        order_pressure = 0.0
-        if buy_orders + sell_orders > 0:
-            order_pressure = ((buy_orders - sell_orders) / max(1.0, buy_orders + sell_orders)) * 10
-
-        forecast_change = (
-            momentum * 0.45
-            + spread_pct * 0.18
-            + volume_score * 0.35
-            + order_pressure * 0.25
-        )
-
-        if total_week_volume > 5_000_000:
-            demand = "Very High"
-        elif total_week_volume > 700_000:
-            demand = "High"
-        elif total_week_volume > 100_000:
-            demand = "Medium"
+    for batch in chunked(rows, batch_size):
+        query = supabase.table(table)
+        if conflict_key:
+            query.upsert(batch, on_conflict=conflict_key).execute()
         else:
-            demand = "Low"
-
-        if abs(momentum) > 20:
-            risk = "Volatile"
-        elif abs(spread_pct) > 8:
-            risk = "Wide spread"
-        else:
-            risk = "Normal"
-
-        if momentum > 5:
-            driver = "Positive price momentum"
-        elif order_pressure > 2:
-            driver = "Buy order pressure"
-        elif volume_score > 7:
-            driver = "High weekly volume"
-        elif spread_pct > 3:
-            driver = "Bazaar spread opportunity"
-        else:
-            driver = "Stable market activity"
-
-        confidence = 45 + min(22, volume_score * 2.1) - min(12, abs(spread_pct) * 0.35)
-        confidence += min(12, abs(momentum) * 0.4)
-
-    else:
-        listing_score = min(10.0, math.log10(max(1.0, ah_count)) * 3.0)
-        forecast_change = momentum * 0.5 + listing_score * 0.6
-        demand = "Unknown"
-        risk = "AH listing risk" if ah_count <= 2 else "Normal"
-        driver = "Lowest BIN movement"
-        confidence = 40 + min(18, listing_score * 2) + min(12, abs(momentum) * 0.3)
-
-    forecast_change = max(-25.0, min(35.0, forecast_change))
-    confidence = max(35.0, min(92.0, confidence))
-
-    return {
-        "item_id": item_id,
-        "name": name,
-        "current_price": round(current_price, 2),
-        "forecast_change_pct": round(forecast_change, 3),
-        "confidence": round(confidence, 1),
-        "driver": driver,
-        "demand": demand,
-        "risk": risk,
-        "reason": driver,
-        "updated_at": utc_now()
-    }
+            query.insert(batch).execute()
 
 
-def collect_bazaar(previous_prices):
-    print("Pulling Bazaar data...")
-    payload = get_json(HYPIXEL_BAZAAR_URL)
-
-    if not payload.get("success"):
-        raise RuntimeError("Hypixel Bazaar API did not return success.")
-
-    now = utc_now()
-    item_rows = []
-    snapshot_rows = []
-    prediction_rows = []
-
-    for product_id, product in payload.get("products", {}).items():
-        quick = product.get("quick_status", {})
-
-        buy_price = safe_float(quick.get("buyPrice"))
+def collect_bazaar_items():
+    products = fetch_bazaar()
+    updated_at = now_iso()
+    items = []
+    snapshots = []
+    for product_id, product in products.items():
+        quick = product.get("quick_status", {}) or {}
         sell_price = safe_float(quick.get("sellPrice"))
-        current_price = buy_price if buy_price > 0 else sell_price
-
+        buy_price = safe_float(quick.get("buyPrice"))
+        current_price = sell_price or buy_price
         if current_price < MINIMUM_PRICE:
             continue
-
-        name = nice_name(product_id)
-
-        item_rows.append({
+        name = bz_name(product_id)
+        spread = spread_pct(buy_price, sell_price)
+        buy_volume = safe_float(quick.get("buyVolume"))
+        sell_volume = safe_float(quick.get("sellVolume"))
+        buy_moving_week = safe_float(quick.get("buyMovingWeek"))
+        sell_moving_week = safe_float(quick.get("sellMovingWeek"))
+        volume_24h = buy_volume + sell_volume
+        buy_orders = safe_float(quick.get("buyOrders"))
+        sell_orders = safe_float(quick.get("sellOrders"))
+        row = {
             "id": product_id,
             "name": name,
             "source": "bazaar",
-            "current_price": round(current_price, 2),
-            "buy_price": round(buy_price, 2),
-            "sell_price": round(sell_price, 2),
-            "buy_volume": safe_float(quick.get("buyVolume")),
-            "sell_volume": safe_float(quick.get("sellVolume")),
-            "buy_moving_week": safe_float(quick.get("buyMovingWeek")),
-            "sell_moving_week": safe_float(quick.get("sellMovingWeek")),
-            "updated_at": now,
-        })
-
-        snapshot_rows.append({
+            "market_type": "bazaar",
+            "source_tag": "BZ",
+            "category": category_guess(name),
+            "current_price": current_price,
+            "buy_price": buy_price,
+            "sell_price": sell_price,
+            "spread_pct": spread,
+            "buy_volume": buy_volume,
+            "sell_volume": sell_volume,
+            "buy_moving_week": buy_moving_week,
+            "sell_moving_week": sell_moving_week,
+            "buy_orders": buy_orders,
+            "sell_orders": sell_orders,
+            "volume": volume_24h,
+            "volume_24h": volume_24h,
+            "listed_count": safe_int(sell_orders),
+            "sold_count_24h": None,
+            "price_change_5m_pct": None,
+            "history_points": 0,
+            "example_names": [],
+            "tags": ["bazaar"],
+            "updated_at": updated_at,
+            "raw_data": quick,
+        }
+        items.append(row)
+        snapshots.append({
             "item_id": product_id,
-            "price": round(current_price, 2),
-            "buy_price": round(buy_price, 2),
-            "sell_price": round(sell_price, 2),
-            "buy_volume": safe_float(quick.get("buyVolume")),
-            "sell_volume": safe_float(quick.get("sellVolume")),
-            "buy_moving_week": safe_float(quick.get("buyMovingWeek")),
-            "sell_moving_week": safe_float(quick.get("sellMovingWeek")),
-            "created_at": now,
+            "price": current_price,
+            "current_price": current_price,
+            "buy_price": buy_price,
+            "sell_price": sell_price,
+            "buy_volume": buy_volume,
+            "sell_volume": sell_volume,
+            "buy_moving_week": buy_moving_week,
+            "sell_moving_week": sell_moving_week,
+            "buy_orders": buy_orders,
+            "sell_orders": sell_orders,
+            "volume": volume_24h,
+            "volume_24h": volume_24h,
+            "listed_count": safe_int(sell_orders),
+            "spread_pct": spread,
+            "source": "bazaar",
+            "market_type": "bazaar",
+            "raw_data": quick,
+            "created_at": updated_at,
         })
-
-        prediction_rows.append(
-            score_market_item(
-                item_id=product_id,
-                name=name,
-                source="bazaar",
-                current_price=current_price,
-                previous_price=previous_prices.get(product_id),
-                quick=quick
-            )
-        )
-
-    print(f"Bazaar items collected: {len(item_rows)}")
-    return item_rows, snapshot_rows, prediction_rows
+    return items, snapshots
 
 
-def fetch_auction_pages():
-    print("Pulling Auction House data...")
-    first = get_json(HYPIXEL_AUCTIONS_URL, {"page": 0})
-
-    if not first.get("success"):
-        raise RuntimeError("Hypixel Auction API did not return success.")
-
-    total_pages = int(first.get("totalPages", 1))
-
-    if AH_MAX_PAGES != "all":
-        total_pages = min(total_pages, max(1, int(AH_MAX_PAGES)))
-
-    auctions = []
-    for page in range(total_pages):
-        if page == 0:
-            payload = first
-        else:
-            payload = get_json(HYPIXEL_AUCTIONS_URL, {"page": page})
-            time.sleep(SLEEP_BETWEEN_AH_PAGES)
-
-        page_auctions = payload.get("auctions", [])
-        auctions.extend(page_auctions)
-        print(f"AH page {page + 1}/{total_pages} | total auctions collected: {len(auctions)}")
-
-    return auctions
-
-
-def collect_auction_house(previous_prices):
-    auctions = fetch_auction_pages()
-    lowest_bins = {}
-
-    for auction in auctions:
-        if not auction.get("bin"):
+def collect_auction_items():
+    updated_at = now_iso()
+    grouped = {}
+    first = fetch_auction_page(0)
+    total_pages = safe_int(first.get("totalPages"), 0)
+    pages_to_fetch = total_pages
+    if str(AH_MAX_PAGES).lower() != "all":
+        pages_to_fetch = min(total_pages, safe_int(AH_MAX_PAGES, 5))
+    print(f"Auction pages available: {total_pages}; fetching: {pages_to_fetch}")
+    for page in range(pages_to_fetch):
+        data = first if page == 0 else fetch_auction_page(page)
+        for auction in data.get("auctions", []) or []:
+            if not auction.get("bin"):
+                continue
+            name = str(auction.get("item_name") or "").strip()
+            if not name:
+                continue
+            price = safe_float(auction.get("starting_bid"))
+            if price < MINIMUM_PRICE:
+                continue
+            item_id = ah_item_id(name)
+            g = grouped.setdefault(item_id, {"id": item_id, "name": name, "source": "auction", "market_type": "auction", "source_tag": "AH", "category": category_guess(name), "prices": [], "example_names": set(), "listed_count": 0, "raw_examples": []})
+            g["prices"].append(price)
+            g["listed_count"] += 1
+            g["example_names"].add(name)
+            if len(g["raw_examples"]) < 3:
+                g["raw_examples"].append({"uuid": auction.get("uuid"), "starting_bid": price, "tier": auction.get("tier"), "category": auction.get("category"), "end": auction.get("end")})
+    items = []
+    snapshots = []
+    for item_id, g in grouped.items():
+        prices = sorted([p for p in g["prices"] if p > 0])
+        if not prices:
             continue
-
-        name = clean_name(auction.get("item_name"))
-        price = safe_float(auction.get("starting_bid"))
-
-        if not name or price < MINIMUM_PRICE:
-            continue
-
-        key = name.lower()
-
-        if key not in lowest_bins:
-            lowest_bins[key] = {
-                "name": name,
-                "current_price": price,
-                "count": 1
-            }
-        else:
-            lowest_bins[key]["count"] += 1
-            if price < lowest_bins[key]["current_price"]:
-                lowest_bins[key]["current_price"] = price
-
-    now = utc_now()
-    item_rows = []
-    snapshot_rows = []
-    prediction_rows = []
-
-    for item in lowest_bins.values():
-        item_id = stable_ah_id(item["name"])
-        current_price = safe_float(item["current_price"])
-
-        item_rows.append({
+        lowest = prices[0]
+        second = prices[1] if len(prices) > 1 else None
+        med = median(prices)
+        avg = sum(prices) / len(prices)
+        spread = pct_change(lowest, second) if second else 0.0
+        row = {
             "id": item_id,
-            "name": item["name"],
+            "name": g["name"],
             "source": "auction",
-            "current_price": round(current_price, 2),
-            "buy_price": 0,
-            "sell_price": 0,
-            "buy_volume": item.get("count", 0),
-            "sell_volume": 0,
-            "buy_moving_week": 0,
-            "sell_moving_week": 0,
-            "updated_at": now,
-        })
-
-        snapshot_rows.append({
+            "market_type": "auction",
+            "source_tag": "AH",
+            "category": g["category"],
+            "current_price": lowest,
+            "fair_price": med,
+            "median_price": med,
+            "avg_price": avg,
+            "second_lowest_price": second,
+            "buy_price": None,
+            "sell_price": lowest,
+            "spread_pct": spread,
+            "volume": len(prices),
+            "volume_24h": len(prices),
+            "listed_count": g["listed_count"],
+            "sold_count_24h": None,
+            "price_change_5m_pct": None,
+            "history_points": 0,
+            "example_names": sorted(list(g["example_names"]))[:8],
+            "tags": ["auction", g["category"]],
+            "updated_at": updated_at,
+            "raw_data": {"examples": g["raw_examples"]},
+        }
+        items.append(row)
+        snapshots.append({
             "item_id": item_id,
-            "price": round(current_price, 2),
-            "buy_price": 0,
-            "sell_price": 0,
-            "buy_volume": item.get("count", 0),
-            "sell_volume": 0,
-            "buy_moving_week": 0,
-            "sell_moving_week": 0,
-            "created_at": now,
+            "price": lowest,
+            "current_price": lowest,
+            "fair_price": med,
+            "median_price": med,
+            "avg_price": avg,
+            "second_lowest_price": second,
+            "buy_price": None,
+            "sell_price": lowest,
+            "volume": len(prices),
+            "volume_24h": len(prices),
+            "listed_count": g["listed_count"],
+            "spread_pct": spread,
+            "source": "auction",
+            "market_type": "auction",
+            "raw_data": {"examples": g["raw_examples"]},
+            "created_at": updated_at,
         })
-
-        prediction_rows.append(
-            score_market_item(
-                item_id=item_id,
-                name=item["name"],
-                source="auction",
-                current_price=current_price,
-                previous_price=previous_prices.get(item_id),
-                ah_count=item.get("count", 0)
-            )
-        )
-
-    print(f"Auction item types collected: {len(item_rows)}")
-    return item_rows, snapshot_rows, prediction_rows
+    return items, snapshots
 
 
-def parse_minister_from_payload(payload):
-    """
-    Hypixel's election resource may change shape over time.
-    This parser intentionally reads the current mayor object first and only
-    uses minister-like fields if they are actually present.
-    It does NOT use the next election leader as current mayor.
-    """
-    mayor = payload.get("mayor") or {}
+def build_predictions(items):
+    factors = load_prediction_factors(supabase)
+    rows = []
+    for item in items:
+        history = get_recent_history(item["id"], 20)
+        matched = match_factors_to_item(item, factors)
+        pred = score_item(item, history=history, matched_factors=matched)
+        pred["updated_at"] = now_iso()
+        rows.append(pred)
+    return rows
 
-    candidates = []
-    election = payload.get("current") or payload.get("election") or {}
-    if isinstance(election, dict):
-        candidates = election.get("candidates") or []
 
-    possible = [
-        mayor.get("minister"),
-        mayor.get("minister_candidate"),
-        mayor.get("ministerCandidate"),
-        payload.get("minister"),
-        payload.get("current_minister"),
+def update_market_context(bz_count, ah_count):
+    mayor = fetch_current_mayor_context()
+    meta = fetch_meta_context()
+
+    source_status = [
+        {"name": "Hypixel Bazaar", "ok": True},
+        {"name": "Hypixel Auctions", "ok": True},
+        {"name": "Hypixel Election API", "ok": mayor.get("ok"), "source": mayor.get("source")},
+        {"name": "OutcroCalculator", "ok": meta.get("ok"), "source": meta.get("source")},
     ]
 
-    for obj in possible:
-        if isinstance(obj, dict):
-            name = obj.get("name") or obj.get("candidate") or obj.get("mayor")
-            perk_obj = obj.get("perk") or obj.get("minister_perk") or obj.get("ministerPerk") or {}
-            perk_name = ""
-            perk_desc = ""
-
-            if isinstance(perk_obj, dict):
-                perk_name = perk_obj.get("name") or perk_obj.get("perk") or ""
-                perk_desc = perk_obj.get("description") or perk_obj.get("desc") or ""
-            elif isinstance(perk_obj, str):
-                perk_name = perk_obj
-
-            if not perk_name:
-                perk_name = obj.get("perk_name") or obj.get("perkName") or obj.get("minister_perk_name") or ""
-            if not perk_desc:
-                perk_desc = obj.get("perk_description") or obj.get("perkDescription") or ""
-
-            if name:
-                return name, perk_name or "Unknown minister perk", perk_desc
-
-    # If API does not expose the minister cleanly, don't guess from next election.
-    return "Minister unavailable", "Minister perk unavailable", "Hypixel API did not expose a parsed minister field."
-
-
-def fetch_current_election_context():
-    try:
-        payload = get_json(HYPIXEL_ELECTION_URL)
-        mayor = payload.get("mayor") or {}
-
-        mayor_name = mayor.get("name") or "Unknown mayor"
-        perks_raw = mayor.get("perks") or []
-        mayor_perks = []
-
-        for perk in perks_raw:
-            if isinstance(perk, dict):
-                perk_name = perk.get("name")
-                if perk_name:
-                    mayor_perks.append(perk_name)
-            elif isinstance(perk, str):
-                mayor_perks.append(perk)
-
-        minister_name, minister_perk, minister_desc = parse_minister_from_payload(payload)
-
-        return {
-            "current_mayor": mayor_name,
-            "current_mayor_perks": ", ".join(mayor_perks) if mayor_perks else "No mayor perks parsed yet.",
-            "current_minister": minister_name,
-            "current_minister_perk": minister_perk,
-            "current_minister_perk_description": minister_desc,
-            "election_year": str(payload.get("lastUpdated") or ""),
-            "raw_payload": payload
-        }
-
-    except Exception as exc:
-        return {
-            "current_mayor": f"Unknown mayor ({exc})",
-            "current_mayor_perks": "Unavailable",
-            "current_minister": "Minister unavailable",
-            "current_minister_perk": "Minister perk unavailable",
-            "current_minister_perk_description": str(exc),
-            "election_year": "",
-            "raw_payload": {"error": str(exc)}
-        }
-
-
-def update_market_context(stats):
-    election = fetch_current_election_context()
-
-    current_meta = (
-        CURRENT_META_OVERRIDE
-        if CURRENT_META_OVERRIDE
-        else "Market context feed"
-    )
-
-    context_row = {
+    context = {
         "id": 1,
-        "current_mayor": election["current_mayor"],
-        "current_mayor_perks": election["current_mayor_perks"],
-        "current_minister": election["current_minister"],
-        "current_minister_perk": election["current_minister_perk"],
-        "current_minister_perk_description": election["current_minister_perk_description"],
-        "current_meta": current_meta,
-        "ai_factor_1": f"{stats.get('total_items', 0)} items tracked",
-        "ai_factor_2": f"{stats.get('auction_items', 0)} AH item types + {stats.get('bazaar_items', 0)} BZ products",
-        "updated_at": utc_now()
+        "project_name": PROJECT_NAME,
+
+        # Mayor fields
+        "current_mayor": mayor.get("current_mayor"),
+        "current_mayor_key": mayor.get("current_mayor_key"),
+        "current_mayor_perks": mayor.get("current_mayor_perks", []),
+
+        # Minister fields
+        "current_minister": mayor.get("current_minister"),
+        "current_minister_key": mayor.get("current_minister_key"),
+        "current_minister_perk": mayor.get("current_minister_perk"),
+        "current_minister_perk_description": mayor.get("current_minister_perk_description"),
+
+        # Election/meta fields
+        "election_year": mayor.get("election_year"),
+        "election_candidates": mayor.get("election_candidates", []),
+        "current_meta": meta.get("current_meta"),
+        "meta_methods": meta.get("meta_methods", []),
+
+        # Tracking stats
+        "tracked_items_total": bz_count + ah_count,
+        "tracked_bazaar_items": bz_count,
+        "tracked_auction_items": ah_count,
+        "ai_factor_1": f"Tracking {bz_count + ah_count:,} total AH + BZ grouped items",
+        "ai_factor_2": "Prediction engine uses supply, demand, spreads, manipulation risk, and factor-bank matches",
+        "source_status": source_status,
+        "updated_at": now_iso(),
     }
 
-    supabase.table("market_context").upsert(context_row).execute()
+    supabase.table("market_context").upsert(context, on_conflict="id").execute()
+
+def cleanup_old_snapshots():
+    try:
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=SNAPSHOT_KEEP_DAYS)).isoformat()
+        supabase.table("price_snapshots").delete().lt("created_at", cutoff).execute()
+        print(f"Cleaned snapshots older than {SNAPSHOT_KEEP_DAYS} days")
+    except Exception as exc:
+        print(f"Snapshot cleanup skipped: {exc}")
 
 
 def collect_all():
-    previous_prices = fetch_previous_prices()
-
-    bz_items, bz_snapshots, bz_predictions = collect_bazaar(previous_prices)
-    ah_items, ah_snapshots, ah_predictions = collect_auction_house(previous_prices)
-
-    item_rows = bz_items + ah_items
-    snapshot_rows = bz_snapshots + ah_snapshots
-    prediction_rows = bz_predictions + ah_predictions
-
-    print(f"Upserting {len(item_rows)} items...")
-    upsert_rows("items", item_rows)
-
-    print(f"Inserting {len(snapshot_rows)} price snapshots...")
-    insert_rows("price_snapshots", snapshot_rows)
-
-    print(f"Upserting {len(prediction_rows)} predictions...")
-    upsert_rows("predictions", prediction_rows)
-
-    stats = {
-        "bazaar_items": len(bz_items),
-        "auction_items": len(ah_items),
-        "total_items": len(item_rows),
-        "snapshots": len(snapshot_rows),
-        "predictions": len(prediction_rows),
-        "ah_max_pages": AH_MAX_PAGES,
-        "minimum_price": MINIMUM_PRICE
-    }
-
-    update_market_context(stats)
-
-    print(
-        f"Saved {stats['total_items']} items, "
-        f"{stats['snapshots']} snapshots, "
-        f"{stats['predictions']} predictions."
-    )
+    print(f"SBP collector running: all Bazaar + active Auction House + context + predictions ({VERSION})")
+    bz_items, bz_snapshots = collect_bazaar_items()
+    print(f"Bazaar collected: {len(bz_items)} items")
+    ah_items, ah_snapshots = collect_auction_items()
+    print(f"Auction House collected: {len(ah_items)} grouped items")
+    all_items = bz_items + ah_items
+    all_snapshots = bz_snapshots + ah_snapshots
+    print("Building predictions...")
+    prediction_rows = build_predictions(all_items)
+    print("Writing items...")
+    upsert_rows("items", all_items, conflict_key="id", batch_size=500)
+    print("Writing snapshots...")
+    upsert_rows("price_snapshots", all_snapshots, conflict_key=None, batch_size=500)
+    print("Writing predictions...")
+    upsert_rows("predictions", prediction_rows, conflict_key="item_id", batch_size=500)
+    update_market_context(len(bz_items), len(ah_items))
+    cleanup_old_snapshots()
+    print(f"Saved {len(all_items)} items ({len(bz_items)} BZ + {len(ah_items)} AH), {len(all_snapshots)} snapshots, {len(prediction_rows)} predictions.")
 
 
 if __name__ == "__main__":
