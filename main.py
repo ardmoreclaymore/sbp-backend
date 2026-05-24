@@ -35,23 +35,80 @@ def api_stats():
     return api_context()
 
 
+
+def _dedupe_key(row):
+    name = str(row.get("name") or row.get("item_name") or "").strip().lower()
+    source = str(row.get("source") or row.get("market_type") or "").strip().lower()
+    return f"{source}|{name}"
+
+
+def _parse_time(value):
+    from datetime import datetime, timezone
+    if not value:
+        return datetime.fromtimestamp(0, tz=timezone.utc)
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except Exception:
+        return datetime.fromtimestamp(0, tz=timezone.utc)
+
+
+def _better_duplicate(candidate, current):
+    """
+    Pick the live/current duplicate.
+
+    Duplicate AH rows happened because older collector versions generated different
+    item IDs for the same item name. Keep the newest row first. If timestamps tie,
+    keep the cheaper AH row because AH represents lowest BIN.
+    """
+    if current is None:
+        return candidate
+
+    candidate_time = _parse_time(candidate.get("updated_at"))
+    current_time = _parse_time(current.get("updated_at"))
+
+    if candidate_time > current_time:
+        return candidate
+    if candidate_time < current_time:
+        return current
+
+    source = str(candidate.get("source") or current.get("source") or "").lower()
+    if source == "auction":
+        cand_price = float(candidate.get("current_price") or 0)
+        curr_price = float(current.get("current_price") or 0)
+        if cand_price > 0 and (curr_price <= 0 or cand_price < curr_price):
+            return candidate
+
+    cand_score = float(candidate.get("rank_score") or candidate.get("forecast_change_pct") or 0)
+    curr_score = float(current.get("rank_score") or current.get("forecast_change_pct") or 0)
+    return candidate if cand_score > curr_score else current
+
+
+def _dedupe_rows(rows):
+    deduped = {}
+    for row in rows or []:
+        key = _dedupe_key(row)
+        if not key.strip("|"):
+            key = str(row.get("item_id") or row.get("id") or len(deduped))
+        deduped[key] = _better_duplicate(row, deduped.get(key))
+    return list(deduped.values())
+
 @app.get("/api/top20")
 def api_top20(limit: int = Query(TOP_LIMIT, ge=1, le=100), hide_manipulated: bool = False):
     """
-    Safe Top 20 endpoint.
+    Safe + deduped Top 20 endpoint.
 
-    The frontend calls /api/top20?hide_manipulated=false.
-    Earlier schema/version mismatches can break if rank_score or manipulation_score
-    does not exist, so this endpoint falls back cleanly instead of returning 500.
+    Duplicate rows can exist from old AH ID formats. This returns one row per
+    source/name pair and falls back cleanly if schema columns differ.
     """
     try:
-        # First choice: v7 prediction ranking.
+        raw_limit = min(max(limit * 8, 80), 800)
+
         try:
             response = (
                 supabase.table("predictions")
                 .select("*")
                 .order("rank_score", desc=True)
-                .limit(limit)
+                .limit(raw_limit)
                 .execute()
             )
             rows = response.data or []
@@ -62,7 +119,7 @@ def api_top20(limit: int = Query(TOP_LIMIT, ge=1, le=100), hide_manipulated: boo
                     supabase.table("predictions")
                     .select("*")
                     .order("forecast_change_pct", desc=True)
-                    .limit(limit)
+                    .limit(raw_limit)
                     .execute()
                 )
                 rows = response.data or []
@@ -71,7 +128,7 @@ def api_top20(limit: int = Query(TOP_LIMIT, ge=1, le=100), hide_manipulated: boo
                 response = (
                     supabase.table("predictions")
                     .select("*")
-                    .limit(limit)
+                    .limit(raw_limit)
                     .execute()
                 )
                 rows = response.data or []
@@ -82,18 +139,19 @@ def api_top20(limit: int = Query(TOP_LIMIT, ge=1, le=100), hide_manipulated: boo
                 if float(row.get("manipulation_score") or 0) < 50
             ]
 
-        # If predictions table is empty, show a basic item fallback instead of a dead panel.
+        rows = _dedupe_rows(rows)
+
         if not rows:
             item_response = (
                 supabase.table("items")
                 .select("*")
                 .order("current_price", desc=True)
-                .limit(limit)
+                .limit(raw_limit)
                 .execute()
             )
 
             fallback_rows = []
-            for item in item_response.data or []:
+            for item in _dedupe_rows(item_response.data or []):
                 fallback_rows.append({
                     "item_id": item.get("id"),
                     "name": item.get("name"),
@@ -109,14 +167,15 @@ def api_top20(limit: int = Query(TOP_LIMIT, ge=1, le=100), hide_manipulated: boo
                     "risk": "No prediction row yet",
                     "market_type": item.get("market_type"),
                     "category": item.get("category"),
+                    "updated_at": item.get("updated_at"),
                 })
             rows = fallback_rows
 
-        return rows
+        rows.sort(key=lambda row: float(row.get("rank_score") or row.get("forecast_change_pct") or 0), reverse=True)
+        return rows[:limit]
 
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))
-
 
 @app.get("/api/items")
 def api_items(limit: int = Query(SEARCH_LIMIT, ge=1, le=200)):
@@ -130,6 +189,9 @@ def api_items(limit: int = Query(SEARCH_LIMIT, ge=1, le=200)):
 @app.get("/api/search")
 def api_search(q: str = Query("", min_length=0), source: str = Query("", min_length=0), limit: int = Query(SEARCH_LIMIT, ge=1, le=100)):
     try:
+        # Pull extra rows before dedupe because old collector IDs may create duplicates.
+        raw_limit = min(max(limit * 8, 80), 800)
+
         query = supabase.table("items").select("*")
         if q:
             query = query.ilike("name", f"%{q}%")
@@ -139,11 +201,16 @@ def api_search(q: str = Query("", min_length=0), source: str = Query("", min_len
                 query = query.eq("source", "auction")
             elif source_l in ["bazaar", "bz"]:
                 query = query.eq("source", "bazaar")
-        response = query.order("current_price", desc=True).limit(limit).execute()
-        return response.data or []
+
+        response = query.order("updated_at", desc=True).limit(raw_limit).execute()
+        rows = _dedupe_rows(response.data or [])
+
+        # For display: expensive first, but without duplicate names.
+        rows.sort(key=lambda row: float(row.get("current_price") or 0), reverse=True)
+        return rows[:limit]
+
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))
-
 
 @app.get("/api/item/{item_id}")
 def api_item(item_id: str):
