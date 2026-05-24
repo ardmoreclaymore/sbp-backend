@@ -13,24 +13,23 @@ SUPABASE_SERVICE_KEY = os.environ["SUPABASE_SERVICE_KEY"]
 
 supabase = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
 
-print("SBP FINAL COLLECTOR ALL AH + ALL BZ VERSION RUNNING")
+print("SBP SCREENSHOT WEBSITE COLLECTOR: ALL AH + ALL BZ + MAYOR + MINISTER")
 
 HYPIXEL_BAZAAR_URL = "https://api.hypixel.net/v2/skyblock/bazaar"
 HYPIXEL_AUCTIONS_URL = "https://api.hypixel.net/v2/skyblock/auctions"
 HYPIXEL_ELECTION_URL = "https://api.hypixel.net/v2/resources/skyblock/election"
 
+# 0 means even wheat-level Bazaar products are tracked.
 MINIMUM_PRICE = int(os.getenv("MINIMUM_PRICE", "0"))
 
-# Use "all" for a full AH sweep. Use a number like "10" for testing.
-# With MINIMUM_PRICE=0, this collects cheap items too, including wheat-level Bazaar products.
+# Use "all" for full Auction House sweep. Use 10/25/50 for testing.
 AH_MAX_PAGES = os.getenv("AH_MAX_PAGES", "all").strip().lower()
 
 SLEEP_BETWEEN_AH_PAGES = float(os.getenv("SLEEP_BETWEEN_AH_PAGES", "0.25"))
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "45"))
 UPSERT_CHUNK_SIZE = int(os.getenv("UPSERT_CHUNK_SIZE", "500"))
 
-# Meta is subjective. Set this manually in Render env later if you want a verified label.
-# Example: CURRENT_META_OVERRIDE="Kuudra / Aurora attribute demand"
+# Optional manual meta label. Do not fake meta automatically.
 CURRENT_META_OVERRIDE = os.getenv("CURRENT_META_OVERRIDE", "").strip()
 
 
@@ -75,10 +74,31 @@ def stable_ah_id(item_name):
     return f"AH:{digest}"
 
 
+def guess_category(name, source="bazaar"):
+    text = (name or "").upper()
+    if "KUUDRA" in text:
+        return "KUUDRA"
+    if "ENCHANT" in text or "BOOK" in text:
+        return "ENCHANT"
+    if "ESSENCE" in text or "DUNGEON" in text or "NECRON" in text or "STORM" in text or "WITHER" in text:
+        return "DUNGEON"
+    if "DRAGON" in text or "SLAYER" in text or "REVENANT" in text or "TARANTULA" in text or "SVEN" in text or "VOIDGLOOM" in text or "BLAZE" in text:
+        return "SLAYER"
+    if "FISH" in text or "SHARK" in text or "ROD" in text:
+        return "FISHING"
+    if "WHEAT" in text or "CARROT" in text or "POTATO" in text or "MELON" in text or "PUMPKIN" in text or "CACTUS" in text:
+        return "FARMING"
+    if "MITHRIL" in text or "GEMSTONE" in text or "JADE" in text or "AMBER" in text or "RUBY" in text or "SAPPHIRE" in text:
+        return "MINING"
+    if source == "auction":
+        return "AUCTION"
+    return "BAZAAR"
+
+
 def get_json(url, params=None):
     response = requests.get(url, params=params, timeout=REQUEST_TIMEOUT)
     if response.status_code == 429:
-        raise RuntimeError(f"Rate limited while requesting {url}. Try a slower schedule or fewer AH pages.")
+        raise RuntimeError(f"Rate limited while requesting {url}. Use fewer AH pages or more delay.")
     response.raise_for_status()
     return response.json()
 
@@ -108,11 +128,10 @@ def fetch_previous_prices():
     start = 0
 
     while True:
-        end = start + page_size - 1
         result = (
             supabase.table("items")
             .select("id,current_price")
-            .range(start, end)
+            .range(start, start + page_size - 1)
             .execute()
         )
         data = result.data or []
@@ -141,7 +160,7 @@ def score_market_item(item_id, name, source, current_price, previous_price, quic
 
     spread_pct = 0.0
     if buy_price > 0 and sell_price > 0:
-        spread_pct = ((buy_price - sell_price) / buy_price) * 100
+        spread_pct = ((buy_price - sell_price) / max(1.0, buy_price)) * 100
 
     if source == "bazaar":
         total_week_volume = buy_moving_week + sell_moving_week
@@ -188,7 +207,6 @@ def score_market_item(item_id, name, source, current_price, previous_price, quic
         confidence += min(12, abs(momentum) * 0.4)
 
     else:
-        # AH prediction is only a placeholder signal until the real AI replaces it.
         listing_score = min(10.0, math.log10(max(1.0, ah_count)) * 3.0)
         forecast_change = momentum * 0.5 + listing_score * 0.6
         demand = "Unknown"
@@ -235,9 +253,11 @@ def collect_bazaar(previous_prices):
         if current_price < MINIMUM_PRICE:
             continue
 
+        name = nice_name(product_id)
+
         item_rows.append({
             "id": product_id,
-            "name": nice_name(product_id),
+            "name": name,
             "source": "bazaar",
             "current_price": round(current_price, 2),
             "buy_price": round(buy_price, 2),
@@ -264,7 +284,7 @@ def collect_bazaar(previous_prices):
         prediction_rows.append(
             score_market_item(
                 item_id=product_id,
-                name=nice_name(product_id),
+                name=name,
                 source="bazaar",
                 current_price=current_price,
                 previous_price=previous_prices.get(product_id),
@@ -272,6 +292,7 @@ def collect_bazaar(previous_prices):
             )
         )
 
+    print(f"Bazaar items collected: {len(item_rows)}")
     return item_rows, snapshot_rows, prediction_rows
 
 
@@ -304,7 +325,6 @@ def fetch_auction_pages():
 
 def collect_auction_house(previous_prices):
     auctions = fetch_auction_pages()
-
     lowest_bins = {}
 
     for auction in auctions:
@@ -376,49 +396,117 @@ def collect_auction_house(previous_prices):
             )
         )
 
+    print(f"Auction item types collected: {len(item_rows)}")
     return item_rows, snapshot_rows, prediction_rows
 
 
-def fetch_current_mayor_text():
+def parse_minister_from_payload(payload):
+    """
+    Hypixel's election resource may change shape over time.
+    This parser intentionally reads the current mayor object first and only
+    uses minister-like fields if they are actually present.
+    It does NOT use the next election leader as current mayor.
+    """
+    mayor = payload.get("mayor") or {}
+
+    candidates = []
+    election = payload.get("current") or payload.get("election") or {}
+    if isinstance(election, dict):
+        candidates = election.get("candidates") or []
+
+    possible = [
+        mayor.get("minister"),
+        mayor.get("minister_candidate"),
+        mayor.get("ministerCandidate"),
+        payload.get("minister"),
+        payload.get("current_minister"),
+    ]
+
+    for obj in possible:
+        if isinstance(obj, dict):
+            name = obj.get("name") or obj.get("candidate") or obj.get("mayor")
+            perk_obj = obj.get("perk") or obj.get("minister_perk") or obj.get("ministerPerk") or {}
+            perk_name = ""
+            perk_desc = ""
+
+            if isinstance(perk_obj, dict):
+                perk_name = perk_obj.get("name") or perk_obj.get("perk") or ""
+                perk_desc = perk_obj.get("description") or perk_obj.get("desc") or ""
+            elif isinstance(perk_obj, str):
+                perk_name = perk_obj
+
+            if not perk_name:
+                perk_name = obj.get("perk_name") or obj.get("perkName") or obj.get("minister_perk_name") or ""
+            if not perk_desc:
+                perk_desc = obj.get("perk_description") or obj.get("perkDescription") or ""
+
+            if name:
+                return name, perk_name or "Unknown minister perk", perk_desc
+
+    # If API does not expose the minister cleanly, don't guess from next election.
+    return "Minister unavailable", "Minister perk unavailable", "Hypixel API did not expose a parsed minister field."
+
+
+def fetch_current_election_context():
     try:
         payload = get_json(HYPIXEL_ELECTION_URL)
         mayor = payload.get("mayor") or {}
 
-        name = mayor.get("name") or "Unknown mayor"
+        mayor_name = mayor.get("name") or "Unknown mayor"
         perks_raw = mayor.get("perks") or []
-        perks = []
+        mayor_perks = []
 
         for perk in perks_raw:
             if isinstance(perk, dict):
                 perk_name = perk.get("name")
                 if perk_name:
-                    perks.append(perk_name)
+                    mayor_perks.append(perk_name)
             elif isinstance(perk, str):
-                perks.append(perk)
+                mayor_perks.append(perk)
 
-        if perks:
-            return f"{name} — {', '.join(perks[:3])}"
-        return name
+        minister_name, minister_perk, minister_desc = parse_minister_from_payload(payload)
+
+        return {
+            "current_mayor": mayor_name,
+            "current_mayor_perks": ", ".join(mayor_perks) if mayor_perks else "No mayor perks parsed yet.",
+            "current_minister": minister_name,
+            "current_minister_perk": minister_perk,
+            "current_minister_perk_description": minister_desc,
+            "election_year": str(payload.get("lastUpdated") or ""),
+            "raw_payload": payload
+        }
 
     except Exception as exc:
-        return f"Unknown mayor ({exc})"
+        return {
+            "current_mayor": f"Unknown mayor ({exc})",
+            "current_mayor_perks": "Unavailable",
+            "current_minister": "Minister unavailable",
+            "current_minister_perk": "Minister perk unavailable",
+            "current_minister_perk_description": str(exc),
+            "election_year": "",
+            "raw_payload": {"error": str(exc)}
+        }
 
 
 def update_market_context(stats):
-    current_mayor = fetch_current_mayor_text()
+    election = fetch_current_election_context()
 
     current_meta = (
         CURRENT_META_OVERRIDE
         if CURRENT_META_OVERRIDE
-        else "Work in progress — verified meta source pending"
+        else "Market context feed"
     )
 
     context_row = {
         "id": 1,
-        "current_mayor": current_mayor,
+        "current_mayor": election["current_mayor"],
+        "current_mayor_perks": election["current_mayor_perks"],
+        "current_minister": election["current_minister"],
+        "current_minister_perk": election["current_minister_perk"],
+        "current_minister_perk_description": election["current_minister_perk_description"],
         "current_meta": current_meta,
         "ai_factor_1": f"{stats.get('total_items', 0)} items tracked",
-        "ai_factor_2": "Update/event slot — work in progress",
+        "ai_factor_2": f"{stats.get('auction_items', 0)} AH item types + {stats.get('bazaar_items', 0)} BZ products",
         "updated_at": utc_now()
     }
 
