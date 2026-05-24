@@ -1,91 +1,161 @@
-from fastapi import FastAPI, HTTPException, Query
+import os
+from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from supabase import create_client
 
-from config import SUPABASE_URL, SUPABASE_SERVICE_KEY, PROJECT_NAME, VERSION, SEARCH_LIMIT, TOP_LIMIT, ITEM_HISTORY_LIMIT
-
-if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
-    raise RuntimeError("Missing SUPABASE_URL or SUPABASE_SERVICE_KEY / SUPABASE_SERVICE_ROLE_KEY")
+SUPABASE_URL = os.environ["SUPABASE_URL"]
+SUPABASE_SERVICE_KEY = os.environ["SUPABASE_SERVICE_KEY"]
 
 supabase = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
-app = FastAPI(title=PROJECT_NAME, version=VERSION)
 
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=False, allow_methods=["*"], allow_headers=["*"])
+app = FastAPI()
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 @app.get("/")
-def root():
-    return {"status": "online", "project": PROJECT_NAME, "version": VERSION, "message": "API online. Use /api/context, /api/top20, /api/items, /api/search, /api/item/{item_id}."}
+def home():
+    return {
+        "status": "online",
+        "project": "SBP SkyBlock Price Predictor",
+        "version": "all-ah-bz-minister-v5"
+    }
 
 
-@app.get("/api/context")
-def api_context():
-    try:
-        response = supabase.table("market_context").select("*").eq("id", 1).limit(1).execute()
-        rows = response.data or []
-        if rows:
-            return rows[0]
-        return {"project_name": PROJECT_NAME, "current_mayor": "Loading mayor data", "current_perks": [], "election_candidates": [], "current_meta": "Loading market context", "meta_methods": [], "tracked_items_total": 0, "tracked_bazaar_items": 0, "tracked_auction_items": 0, "ai_factor_1": "Loading tracked items", "ai_factor_2": "Prediction engine loading", "source_status": [], "updated_at": None}
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc))
-
-
-@app.get("/api/stats")
-def api_stats():
-    return api_context()
+@app.get("/api/top5")
+def top5():
+    result = (
+        supabase.table("predictions")
+        .select("*")
+        .order("forecast_change_pct", desc=True)
+        .limit(5)
+        .execute()
+    )
+    return result.data or []
 
 
 @app.get("/api/top20")
-def api_top20(limit: int = Query(TOP_LIMIT, ge=1, le=100), hide_manipulated: bool = False):
-    try:
-        query = supabase.table("predictions").select("*")
-        if hide_manipulated:
-            query = query.lt("manipulation_score", 50)
-        response = query.order("rank_score", desc=True).limit(limit).execute()
-        return response.data or []
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc))
+def top20():
+    result = (
+        supabase.table("predictions")
+        .select("*")
+        .order("forecast_change_pct", desc=True)
+        .limit(20)
+        .execute()
+    )
+    return result.data or []
 
 
 @app.get("/api/items")
-def api_items(limit: int = Query(SEARCH_LIMIT, ge=1, le=200)):
-    try:
-        response = supabase.table("items").select("*").order("current_price", desc=True).limit(limit).execute()
-        return response.data or []
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc))
+def all_items():
+    result = (
+        supabase.table("items")
+        .select("id,name,current_price,source,updated_at")
+        .order("current_price", desc=True)
+        .limit(50000)
+        .execute()
+    )
+    return result.data or []
 
 
-@app.get("/api/search")
-def api_search(q: str = Query("", min_length=0), source: str = Query("", min_length=0), limit: int = Query(SEARCH_LIMIT, ge=1, le=100)):
+@app.get("/api/context")
+def context():
+    fallback = {
+        "current_mayor": "Loading mayor data",
+        "current_mayor_key": "",
+        "current_mayor_perks": "",
+        "current_minister": "Loading minister data",
+        "current_minister_key": "",
+        "current_minister_perk": "Loading minister perk",
+        "current_minister_perk_description": "",
+        "election_year": None,
+        "current_meta": "Work in progress — verified meta source pending",
+        "ai_factor_1": "Work in progress",
+        "ai_factor_2": "Work in progress",
+        "updated_at": None
+    }
+
     try:
-        query = supabase.table("items").select("*")
-        if q:
-            query = query.ilike("name", f"%{q}%")
-        if source:
-            source_l = source.lower()
-            if source_l in ["auction", "ah"]:
-                query = query.eq("source", "auction")
-            elif source_l in ["bazaar", "bz"]:
-                query = query.eq("source", "bazaar")
-        response = query.order("current_price", desc=True).limit(limit).execute()
-        return response.data or []
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc))
+        result = (
+            supabase.table("market_context")
+            .select("*")
+            .eq("id", 1)
+            .limit(1)
+            .execute()
+        )
+
+        if not result.data:
+            return fallback
+
+        row = result.data[0]
+
+        return {
+            "current_mayor": row.get("current_mayor") or fallback["current_mayor"],
+            "current_mayor_key": row.get("current_mayor_key") or fallback["current_mayor_key"],
+            "current_mayor_perks": row.get("current_mayor_perks") or fallback["current_mayor_perks"],
+            "current_minister": row.get("current_minister") or fallback["current_minister"],
+            "current_minister_key": row.get("current_minister_key") or fallback["current_minister_key"],
+            "current_minister_perk": row.get("current_minister_perk") or fallback["current_minister_perk"],
+            "current_minister_perk_description": row.get("current_minister_perk_description") or fallback["current_minister_perk_description"],
+            "election_year": row.get("election_year") or fallback["election_year"],
+            "current_meta": row.get("current_meta") or fallback["current_meta"],
+            "ai_factor_1": row.get("ai_factor_1") or fallback["ai_factor_1"],
+            "ai_factor_2": row.get("ai_factor_2") or fallback["ai_factor_2"],
+            "updated_at": row.get("updated_at")
+        }
+
+    except Exception as e:
+        fallback["error"] = str(e)
+        return fallback
 
 
 @app.get("/api/item/{item_id}")
-def api_item(item_id: str):
-    try:
-        item_resp = supabase.table("items").select("*").eq("id", item_id).limit(1).execute()
-        item_rows = item_resp.data or []
-        if not item_rows:
-            raise HTTPException(status_code=404, detail="Item not found")
-        pred_resp = supabase.table("predictions").select("*").eq("item_id", item_id).limit(1).execute()
-        hist_resp = supabase.table("price_snapshots").select("*").eq("item_id", item_id).order("created_at", desc=False).limit(ITEM_HISTORY_LIMIT).execute()
-        pred_rows = pred_resp.data or []
-        return {"item": item_rows[0], "prediction": pred_rows[0] if pred_rows else {}, "history": hist_resp.data or []}
-    except HTTPException:
-        raise
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc))
+def item(item_id: str):
+    prediction = (
+        supabase.table("predictions")
+        .select("*")
+        .eq("item_id", item_id)
+        .limit(1)
+        .execute()
+    )
+
+    # One month at 5-minute collection intervals:
+    # 12 snapshots/hour * 24 hours/day * 30 days = 8640 snapshots.
+    history = (
+        supabase.table("price_snapshots")
+        .select("price,created_at")
+        .eq("item_id", item_id)
+        .order("created_at", desc=True)
+        .limit(9000)
+        .execute()
+    )
+
+    history_rows = history.data or []
+    history_rows.reverse()
+
+    return {
+        "prediction": prediction.data[0] if prediction.data else None,
+        "history": history_rows
+    }
+
+
+@app.get("/api/search")
+def search(q: str = ""):
+    if not q:
+        return []
+
+    result = (
+        supabase.table("items")
+        .select("id,name,current_price,source")
+        .or_(f"id.ilike.%{q}%,name.ilike.%{q}%")
+        .order("current_price", desc=True)
+        .limit(50)
+        .execute()
+    )
+    return result.data or []
