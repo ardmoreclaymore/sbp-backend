@@ -37,12 +37,83 @@ def api_stats():
 
 @app.get("/api/top20")
 def api_top20(limit: int = Query(TOP_LIMIT, ge=1, le=100), hide_manipulated: bool = False):
+    """
+    Safe Top 20 endpoint.
+
+    The frontend calls /api/top20?hide_manipulated=false.
+    Earlier schema/version mismatches can break if rank_score or manipulation_score
+    does not exist, so this endpoint falls back cleanly instead of returning 500.
+    """
     try:
-        query = supabase.table("predictions").select("*")
+        # First choice: v7 prediction ranking.
+        try:
+            response = (
+                supabase.table("predictions")
+                .select("*")
+                .order("rank_score", desc=True)
+                .limit(limit)
+                .execute()
+            )
+            rows = response.data or []
+        except Exception as rank_exc:
+            print(f"/api/top20 rank_score order failed, falling back to forecast_change_pct: {rank_exc}")
+            try:
+                response = (
+                    supabase.table("predictions")
+                    .select("*")
+                    .order("forecast_change_pct", desc=True)
+                    .limit(limit)
+                    .execute()
+                )
+                rows = response.data or []
+            except Exception as forecast_exc:
+                print(f"/api/top20 forecast order failed, falling back to plain select: {forecast_exc}")
+                response = (
+                    supabase.table("predictions")
+                    .select("*")
+                    .limit(limit)
+                    .execute()
+                )
+                rows = response.data or []
+
         if hide_manipulated:
-            query = query.lt("manipulation_score", 50)
-        response = query.order("rank_score", desc=True).limit(limit).execute()
-        return response.data or []
+            rows = [
+                row for row in rows
+                if float(row.get("manipulation_score") or 0) < 50
+            ]
+
+        # If predictions table is empty, show a basic item fallback instead of a dead panel.
+        if not rows:
+            item_response = (
+                supabase.table("items")
+                .select("*")
+                .order("current_price", desc=True)
+                .limit(limit)
+                .execute()
+            )
+
+            fallback_rows = []
+            for item in item_response.data or []:
+                fallback_rows.append({
+                    "item_id": item.get("id"),
+                    "name": item.get("name"),
+                    "source": item.get("source"),
+                    "current_price": item.get("current_price"),
+                    "forecast_change_pct": 0,
+                    "rank_score": 0,
+                    "predicted_direction": "STABLE",
+                    "confidence": 0,
+                    "certainty": 0,
+                    "manipulation_score": 0,
+                    "reason": "Waiting for prediction data",
+                    "risk": "No prediction row yet",
+                    "market_type": item.get("market_type"),
+                    "category": item.get("category"),
+                })
+            rows = fallback_rows
+
+        return rows
+
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))
 
