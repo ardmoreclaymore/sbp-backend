@@ -1,3 +1,4 @@
+import os
 from datetime import datetime, timezone, timedelta
 from statistics import median
 
@@ -9,7 +10,7 @@ from normalizers import safe_float, safe_int, bz_name, ah_item_id, category_gues
 from predictor import score_item
 from factor_loader import load_prediction_factors, match_factors_to_item
 
-print("COLLECTOR VERSION: AH_BZ_V7_FIXED")
+print("COLLECTOR VERSION: AH_BZ_V7_FAST_PREDICTIONS")
 
 if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
     raise RuntimeError("Missing SUPABASE_URL or SUPABASE_SERVICE_KEY / SUPABASE_SERVICE_ROLE_KEY")
@@ -208,62 +209,76 @@ def collect_auction_items():
 
 
 def build_predictions(items):
-    factors = load_prediction_factors(supabase)
+    """
+    FAST MODE.
+
+    Old v7 was slow because it did this for every item:
+    - 1 Supabase history query
+    - factor matching against the whole factor bank
+
+    With 6,000+ AH/BZ items, that becomes thousands of network calls and can run for 50+ minutes.
+
+    This version builds quick predictions directly from the current item row only.
+    It is less intelligent, but it should finish in minutes instead of crawling forever.
+    Later, real AI can replace this table entirely.
+    """
+    use_factor_bank = os.getenv("ENABLE_FACTOR_BANK", "false").strip().lower() == "true"
+
+    factors = []
+    if use_factor_bank:
+        # Optional. Keep disabled for speed.
+        factors = load_prediction_factors(supabase)
+
     rows = []
-    for item in items:
-        history = get_recent_history(item["id"], 20)
-        matched = match_factors_to_item(item, factors)
-        pred = score_item(item, history=history, matched_factors=matched)
+    total = len(items)
+
+    for index, item in enumerate(items, start=1):
+        matched = match_factors_to_item(item, factors, limit=8) if factors else []
+        pred = score_item(item, history=[], matched_factors=matched)
         pred["updated_at"] = now_iso()
         rows.append(pred)
+
+        if index % 1000 == 0:
+            print(f"Built {index}/{total} fast predictions")
+
     return rows
 
 
 def update_market_context(bz_count, ah_count):
     mayor = fetch_current_mayor_context()
     meta = fetch_meta_context()
-
     source_status = [
         {"name": "Hypixel Bazaar", "ok": True},
         {"name": "Hypixel Auctions", "ok": True},
-        {"name": "Hypixel Election API", "ok": mayor.get("ok"), "source": mayor.get("source")},
+        {"name": "SkyBlock.Tools Election", "ok": mayor.get("ok"), "source": mayor.get("source")},
         {"name": "OutcroCalculator", "ok": meta.get("ok"), "source": meta.get("source")},
     ]
-
     context = {
         "id": 1,
         "project_name": PROJECT_NAME,
-
-        # Mayor fields
         "current_mayor": mayor.get("current_mayor"),
-        "current_mayor_key": mayor.get("current_mayor_key"),
-        "current_mayor_perks": mayor.get("current_mayor_perks", []),
-
-        # Minister fields
-        "current_minister": mayor.get("current_minister"),
-        "current_minister_key": mayor.get("current_minister_key"),
-        "current_minister_perk": mayor.get("current_minister_perk"),
-        "current_minister_perk_description": mayor.get("current_minister_perk_description"),
-
-        # Election/meta fields
-        "election_year": mayor.get("election_year"),
+        "current_perks": mayor.get("current_perks", []),
         "election_candidates": mayor.get("election_candidates", []),
         "current_meta": meta.get("current_meta"),
         "meta_methods": meta.get("meta_methods", []),
-
-        # Tracking stats
         "tracked_items_total": bz_count + ah_count,
         "tracked_bazaar_items": bz_count,
         "tracked_auction_items": ah_count,
         "ai_factor_1": f"Tracking {bz_count + ah_count:,} total AH + BZ grouped items",
-        "ai_factor_2": "Prediction engine uses supply, demand, spreads, manipulation risk, and factor-bank matches",
+        "ai_factor_2": "Fast prediction mode: supply, demand, spreads, listing depth, and manipulation risk",
         "source_status": source_status,
         "updated_at": now_iso(),
     }
-
     supabase.table("market_context").upsert(context, on_conflict="id").execute()
 
+
 def cleanup_old_snapshots():
+    # Deleting/scanning snapshots every 5 minutes can slow the collector once the table grows.
+    # Keep this off during normal fast cron runs. Run cleanup manually/nightly later.
+    if os.getenv("CLEANUP_SNAPSHOTS_EACH_RUN", "false").strip().lower() != "true":
+        print("Snapshot cleanup skipped: CLEANUP_SNAPSHOTS_EACH_RUN is false")
+        return
+
     try:
         cutoff = (datetime.now(timezone.utc) - timedelta(days=SNAPSHOT_KEEP_DAYS)).isoformat()
         supabase.table("price_snapshots").delete().lt("created_at", cutoff).execute()
@@ -280,7 +295,7 @@ def collect_all():
     print(f"Auction House collected: {len(ah_items)} grouped items")
     all_items = bz_items + ah_items
     all_snapshots = bz_snapshots + ah_snapshots
-    print("Building predictions...")
+    print("Building predictions in FAST mode, no per-item Supabase history queries...")
     prediction_rows = build_predictions(all_items)
     print("Writing items...")
     upsert_rows("items", all_items, conflict_key="id", batch_size=500)
