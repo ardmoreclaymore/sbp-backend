@@ -24,7 +24,7 @@ def home():
     return {
         "status": "online",
         "project": "SBP SkyBlock Price Predictor",
-        "version": "all-ah-bz-minister-v5"
+        "version": "stable-old-aesthetic-rule-predictor-v1"
     }
 
 
@@ -68,13 +68,6 @@ def all_items():
 def context():
     fallback = {
         "current_mayor": "Loading mayor data",
-        "current_mayor_key": "",
-        "current_mayor_perks": "",
-        "current_minister": "Loading minister data",
-        "current_minister_key": "",
-        "current_minister_perk": "Loading minister perk",
-        "current_minister_perk_description": "",
-        "election_year": None,
         "current_meta": "Work in progress — verified meta source pending",
         "ai_factor_1": "Work in progress",
         "ai_factor_2": "Work in progress",
@@ -97,13 +90,6 @@ def context():
 
         return {
             "current_mayor": row.get("current_mayor") or fallback["current_mayor"],
-            "current_mayor_key": row.get("current_mayor_key") or fallback["current_mayor_key"],
-            "current_mayor_perks": row.get("current_mayor_perks") or fallback["current_mayor_perks"],
-            "current_minister": row.get("current_minister") or fallback["current_minister"],
-            "current_minister_key": row.get("current_minister_key") or fallback["current_minister_key"],
-            "current_minister_perk": row.get("current_minister_perk") or fallback["current_minister_perk"],
-            "current_minister_perk_description": row.get("current_minister_perk_description") or fallback["current_minister_perk_description"],
-            "election_year": row.get("election_year") or fallback["election_year"],
             "current_meta": row.get("current_meta") or fallback["current_meta"],
             "ai_factor_1": row.get("ai_factor_1") or fallback["ai_factor_1"],
             "ai_factor_2": row.get("ai_factor_2") or fallback["ai_factor_2"],
@@ -155,7 +141,7 @@ def search(q: str = ""):
         .select("id,name,current_price,source")
         .or_(f"id.ilike.%{q}%,name.ilike.%{q}%")
         .order("current_price", desc=True)
-        .limit(50)
+        .limit(500)
         .execute()
     )
     return result.data or []
